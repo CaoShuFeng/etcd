@@ -15,10 +15,9 @@
 package cmd
 
 import (
-	"encoding/binary"
 	"fmt"
+	"io"
 	"math"
-	"math/rand"
 	"os"
 	"time"
 
@@ -40,45 +39,33 @@ var putCmd = &cobra.Command{
 }
 
 var (
-	keySize int
-	valSize int
-
 	putTotal int
 	putRate  int
 
-	keySpaceSize int
-	seqKeys      bool
-
 	compactInterval   time.Duration
 	compactIndexDelta int64
+	reportFile        string
+	keyFile           string
 )
 
 func init() {
 	RootCmd.AddCommand(putCmd)
-	putCmd.Flags().IntVar(&keySize, "key-size", 8, "Key size of put request")
-	putCmd.Flags().IntVar(&valSize, "val-size", 8, "Value size of put request")
 	putCmd.Flags().IntVar(&putRate, "rate", 0, "Maximum puts per second (0 is no limit)")
 
 	putCmd.Flags().IntVar(&putTotal, "total", 10000, "Total number of put requests")
-	putCmd.Flags().IntVar(&keySpaceSize, "key-space-size", 1, "Maximum possible keys")
-	putCmd.Flags().BoolVar(&seqKeys, "sequential-keys", false, "Use sequential keys")
 	putCmd.Flags().DurationVar(&compactInterval, "compact-interval", 0, `Interval to compact database (do not duplicate this with etcd's 'auto-compaction-retention' flag) (e.g. --compact-interval=5m compacts every 5-minute)`)
 	putCmd.Flags().Int64Var(&compactIndexDelta, "compact-index-delta", 1000, "Delta between current revision and compact revision (e.g. current revision 10000, compact at 9000)")
+	putCmd.Flags().StringVar(&reportFile, "report-file", "-", "where report file is saved, - means stdout")
+	putCmd.Flags().StringVar(&keyFile, "key-file", "-", "where key file is saved, - means stdout")
 }
 
 func putFunc(cmd *cobra.Command, args []string) {
-	if keySpaceSize <= 0 {
-		fmt.Fprintf(os.Stderr, "expected positive --key-space-size, got (%v)", keySpaceSize)
-		os.Exit(1)
-	}
-
 	requests := make(chan v3.Op, totalClients)
 	if putRate == 0 {
 		putRate = math.MaxInt32
 	}
 	limit := rate.NewLimiter(rate.Limit(putRate), 1)
 	clients := mustCreateClients(totalClients, totalConns)
-	k, v := make([]byte, keySize), string(mustRandBytes(valSize))
 
 	bar = pb.New(putTotal)
 	bar.Format("Bom !")
@@ -99,17 +86,34 @@ func putFunc(cmd *cobra.Command, args []string) {
 			}
 		}(clients[i])
 	}
-
+	// 100 must be big enough
+	keys := make(chan string, 100)
+	go func() {
+		var file io.Writer
+		if keyFile == "-" {
+			file = os.Stdout
+		} else {
+			f, err := os.OpenFile(keyFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
+			if err != nil {
+				panic(err)
+			}
+			defer f.Close()
+			file = f
+		}
+		for key := range keys {
+			fmt.Fprintf(file, "%s\n", key)
+		}
+	}()
 	go func() {
 		for i := 0; i < putTotal; i++ {
-			if seqKeys {
-				binary.PutVarint(k, int64(i%keySpaceSize))
-			} else {
-				binary.PutVarint(k, int64(rand.Intn(keySpaceSize)))
-			}
-			requests <- v3.OpPut(string(k), v)
+			k8sKey := getAuditKey()
+			k8sValue := getAuditJson()
+			keys <- k8sKey
+			requests <- v3.OpPut(k8sKey, k8sValue)
+
 		}
 		close(requests)
+		close(keys)
 	}()
 
 	if compactInterval > 0 {
@@ -125,7 +129,17 @@ func putFunc(cmd *cobra.Command, args []string) {
 	wg.Wait()
 	close(r.Results())
 	bar.Finish()
-	fmt.Println(<-rc)
+	res := <-rc
+	if reportFile == "-" {
+		fmt.Println(res)
+	} else {
+		f, err := os.OpenFile(reportFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		fmt.Fprintln(f, res)
+	}
 }
 
 func compactKV(clients []*v3.Client) {

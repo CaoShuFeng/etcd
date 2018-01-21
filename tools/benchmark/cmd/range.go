@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"math"
 	"os"
@@ -41,6 +42,8 @@ var (
 	rangeRate        int
 	rangeTotal       int
 	rangeConsistency string
+	inputFile        string
+	repFile          string
 )
 
 func init() {
@@ -48,18 +51,23 @@ func init() {
 	rangeCmd.Flags().IntVar(&rangeRate, "rate", 0, "Maximum range requests per second (0 is no limit)")
 	rangeCmd.Flags().IntVar(&rangeTotal, "total", 10000, "Total number of range requests")
 	rangeCmd.Flags().StringVar(&rangeConsistency, "consistency", "l", "Linearizable(l) or Serializable(s)")
+	rangeCmd.Flags().StringVar(&inputFile, "key-file", "", "read keys from this file")
+	rangeCmd.Flags().StringVar(&repFile, "report-file", "-", "where report file is saved, - means stdout")
 }
 
 func rangeFunc(cmd *cobra.Command, args []string) {
-	if len(args) == 0 || len(args) > 2 {
+	if (len(args) == 0 && inputFile == "") || len(args) > 2 {
 		fmt.Fprintln(os.Stderr, cmd.Usage())
 		os.Exit(1)
 	}
 
-	k := args[0]
-	end := ""
-	if len(args) == 2 {
-		end = args[1]
+	var k, end string
+	if inputFile == "" {
+		k = args[0]
+		end = ""
+		if len(args) == 2 {
+			end = args[1]
+		}
 	}
 
 	if rangeConsistency == "l" {
@@ -99,21 +107,65 @@ func rangeFunc(cmd *cobra.Command, args []string) {
 		}(clients[i])
 	}
 
-	go func() {
-		for i := 0; i < rangeTotal; i++ {
-			opts := []v3.OpOption{v3.WithRange(end)}
-			if rangeConsistency == "s" {
-				opts = append(opts, v3.WithSerializable())
+	if inputFile != "" {
+		// 100 must be big enough
+		keys := make(chan string, 100)
+		go func() {
+			count := 0
+			file, err := os.Open(inputFile)
+			if err != nil {
+				panic(err)
 			}
-			op := v3.OpGet(k, opts...)
-			requests <- op
-		}
-		close(requests)
-	}()
-
+			defer file.Close()
+			scanner := bufio.NewScanner(file)
+			scanner.Split(bufio.ScanLines)
+			for scanner.Scan() {
+				keys <- scanner.Text()
+				count++
+				if count == rangeTotal {
+					break
+				}
+			}
+			close(keys)
+		}()
+		go func() {
+			for key := range keys {
+				opts := []v3.OpOption{v3.WithRange("")}
+				if rangeConsistency == "s" {
+					opts = append(opts, v3.WithSerializable())
+				}
+				op := v3.OpGet(key, opts...)
+				requests <- op
+			}
+			close(requests)
+		}()
+	} else {
+		go func() {
+			for i := 0; i < rangeTotal; i++ {
+				opts := []v3.OpOption{v3.WithRange(end)}
+				if rangeConsistency == "s" {
+					opts = append(opts, v3.WithSerializable())
+				}
+				op := v3.OpGet(k, opts...)
+				requests <- op
+			}
+			close(requests)
+		}()
+	}
 	rc := r.Run()
 	wg.Wait()
 	close(r.Results())
 	bar.Finish()
-	fmt.Printf("%s", <-rc)
+	res := <-rc
+	if repFile == "-" {
+		fmt.Println(res)
+	} else {
+		f, err := os.OpenFile(repFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
+		if err != nil {
+			panic(err)
+		}
+		defer f.Close()
+		fmt.Fprintln(f, res)
+	}
+
 }
